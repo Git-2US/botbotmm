@@ -1,3 +1,14 @@
+const express = require('express');
+const app = express();
+
+app.get('/', (req, res) => {
+    res.send('Bot is online!');
+});
+
+app.listen(3000, () => {
+    console.log('Web server running on port 3000');
+});
+
 const { Client, GatewayDispatchEvents } = require("discord.js");
 const { Riffy } = require("riffy");
 const { Spotify } = require("riffy-spotify");
@@ -31,6 +42,9 @@ client.riffy = new Riffy(client, config.nodes, {
     plugins: [spotify]
 });
 
+// Store 24/7 mode per guild
+const twentyFourSeven = new Map();
+
 // Command definitions for help command
 const commands = [
     { name: 'play <query>', description: 'Play a song or playlist' },
@@ -42,9 +56,13 @@ const commands = [
     { name: 'nowplaying', description: 'Show current track info' },
     { name: 'volume <0-100>', description: 'Adjust player volume' },
     { name: 'shuffle', description: 'Shuffle the current queue' },
-    { name: 'loop', description: 'Toggle queue loop mode' },
+    { name: 'loop', description: 'Toggle loop mode (none/track/queue)' },
     { name: 'remove <position>', description: 'Remove a track from queue' },
     { name: 'clear', description: 'Clear the current queue' },
+    { name: 'seek <seconds>', description: 'Seek to a position in the track' },
+    { name: 'move <from> <to>', description: 'Move a track to a different position' },
+    { name: 'playnext <query>', description: 'Add a track to the front of the queue' },
+    { name: '247', description: 'Toggle 24/7 mode (stay in voice channel)' },
     { name: 'status', description: 'Show player status' },
     { name: 'help', description: 'Show this help message' }
 ];
@@ -61,7 +79,7 @@ client.on("messageCreate", async (message) => {
     const command = args.shift().toLowerCase();
 
     // Check if user is in a voice channel for music commands
-    const musicCommands = ["play", "skip", "stop", "pause", "resume", "queue", "nowplaying", "volume", "shuffle", "loop", "remove", "clear"];
+    const musicCommands = ["play", "skip", "stop", "pause", "resume", "queue", "nowplaying", "volume", "shuffle", "loop", "remove", "clear", "seek", "move", "playnext", "247"];
     if (musicCommands.includes(command)) {
         if (!message.member.voice.channel) {
             return messages.error(message.channel, "You must be in a voice channel!");
@@ -119,13 +137,52 @@ client.on("messageCreate", async (message) => {
             break;
         }
 
+        case "playnext": {
+            const query = args.join(" ");
+            if (!query) return messages.error(message.channel, "Please provide a search query!");
+
+            const player = client.riffy.players.get(message.guild.id);
+            if (!player) return messages.error(message.channel, "Nothing is playing! Use play command first.");
+
+            try {
+                const resolve = await client.riffy.resolve({
+                    query: query,
+                    requester: message.author,
+                });
+
+                const { loadType, tracks, playlistInfo } = resolve;
+
+                if (loadType === "playlist") {
+                    for (let i = resolve.tracks.length - 1; i >= 0; i--) {
+                        resolve.tracks[i].info.requester = message.author;
+                        player.queue.splice(0, 0, resolve.tracks[i]);
+                    }
+                    messages.addedPlaylist(message.channel, playlistInfo, tracks);
+                } else if (loadType === "search" || loadType === "track") {
+                    const track = tracks.shift();
+                    track.info.requester = message.author;
+                    player.queue.splice(0, 0, track);
+                    messages.success(message.channel, `${emojis.success} Added **${track.info.title}** to play next!`);
+                } else {
+                    return messages.error(message.channel, "No results found! Try with a different search term.");
+                }
+            } catch (error) {
+                console.error(error);
+                return messages.error(message.channel, "An error occurred while resolving the track!");
+            }
+            break;
+        }
+
         case "skip": {
             const player = client.riffy.players.get(message.guild.id);
             if (!player) return messages.error(message.channel, "Nothing is playing!");
-            if (!player.queue.length) return messages.error(message.channel, "No more tracks in queue to skip to!");
             
             player.stop();
-            messages.success(message.channel, "Skipped the current track!");
+            if (!player.queue.length) {
+                messages.success(message.channel, "Skipped the current track!");
+            } else {
+                messages.success(message.channel, "Skipped the current track!");
+            }
             break;
         }
 
@@ -133,6 +190,7 @@ client.on("messageCreate", async (message) => {
             const player = client.riffy.players.get(message.guild.id);
             if (!player) return messages.error(message.channel, "Nothing is playing!");
             
+            twentyFourSeven.delete(message.guild.id);
             player.destroy();
             messages.success(message.channel, "Stopped the music and cleared the queue!");
             break;
@@ -184,8 +242,12 @@ client.on("messageCreate", async (message) => {
             const player = client.riffy.players.get(message.guild.id);
             if (!player) return messages.error(message.channel, "Nothing is playing!");
             
+            if (!args[0]) {
+                return messages.success(message.channel, `Current volume: **${player.volume}%**`);
+            }
+
             const volume = parseInt(args[0]);
-            if (!volume && volume !== 0 || isNaN(volume) || volume < 0 || volume > 100) {
+            if (isNaN(volume) || volume < 0 || volume > 100) {
                 return messages.error(message.channel, "Please provide a valid volume between 0 and 100!");
             }
 
@@ -208,26 +270,93 @@ client.on("messageCreate", async (message) => {
             const player = client.riffy.players.get(message.guild.id);
             if (!player) return messages.error(message.channel, "Nothing is playing!");
 
-            // Get the current loop mode and toggle between NONE and QUEUE
+            // Cycle through loop modes: none -> track -> queue -> none
             const currentMode = player.loop;
-            const newMode = currentMode === "none" ? "queue" : "none";
+            let newMode;
+            let modeMessage;
+
+            switch (currentMode) {
+                case "none":
+                    newMode = "track";
+                    modeMessage = "Looping current track";
+                    break;
+                case "track":
+                    newMode = "queue";
+                    modeMessage = "Looping the queue";
+                    break;
+                case "queue":
+                    newMode = "none";
+                    modeMessage = "Loop disabled";
+                    break;
+                default:
+                    newMode = "none";
+                    modeMessage = "Loop disabled";
+            }
             
             player.setLoop(newMode);
-            messages.success(message.channel, `${newMode === "queue" ? "Enabled" : "Disabled"} loop mode!`);
+            messages.success(message.channel, `${emojis.loop} ${modeMessage}!`);
             break;
         }
 
         case "remove": {
             const player = client.riffy.players.get(message.guild.id);
             if (!player) return messages.error(message.channel, "Nothing is playing!");
+            if (!player.queue.length) return messages.error(message.channel, "Queue is empty!");
             
             const position = parseInt(args[0]);
-            if (!position || isNaN(position) || position < 1 || position > player.queue.length) {
+            if (isNaN(position) || position < 1 || position > player.queue.length) {
                 return messages.error(message.channel, `Please provide a valid track position between 1 and ${player.queue.length}!`);
             }
 
             const removed = player.queue.remove(position - 1);
             messages.success(message.channel, `Removed **${removed.info.title}** from the queue!`);
+            break;
+        }
+
+        case "move": {
+            const player = client.riffy.players.get(message.guild.id);
+            if (!player) return messages.error(message.channel, "Nothing is playing!");
+            if (!player.queue.length) return messages.error(message.channel, "Queue is empty!");
+
+            const from = parseInt(args[0]);
+            const to = parseInt(args[1]);
+
+            if (isNaN(from) || isNaN(to) || from < 1 || from > player.queue.length || to < 1 || to > player.queue.length) {
+                return messages.error(message.channel, `Please provide valid positions between 1 and ${player.queue.length}!`);
+            }
+
+            if (from === to) {
+                return messages.error(message.channel, "The positions are the same!");
+            }
+
+            const track = player.queue.remove(from - 1);
+            player.queue.splice(to - 1, 0, track);
+            messages.success(message.channel, `Moved **${track.info.title}** from position ${from} to ${to}!`);
+            break;
+        }
+
+        case "seek": {
+            const player = client.riffy.players.get(message.guild.id);
+            if (!player) return messages.error(message.channel, "Nothing is playing!");
+            if (!player.queue.current) return messages.error(message.channel, "No track is currently playing!");
+
+            const seconds = parseInt(args[0]);
+            if (isNaN(seconds) || seconds < 0) {
+                return messages.error(message.channel, "Please provide a valid time in seconds!");
+            }
+
+            const ms = seconds * 1000;
+            if (ms > player.queue.current.info.length) {
+                return messages.error(message.channel, "Cannot seek beyond the track length!");
+            }
+
+            player.seek(ms);
+            const formatTime = (ms) => {
+                const minutes = Math.floor(ms / 60000);
+                const seconds = Math.floor((ms % 60000) / 1000);
+                return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+            };
+            messages.success(message.channel, `Seeked to ${formatTime(ms)}`);
             break;
         }
 
@@ -238,6 +367,21 @@ client.on("messageCreate", async (message) => {
 
             player.queue.clear();
             messages.success(message.channel, "Cleared the queue!");
+            break;
+        }
+
+        case "247": {
+            const player = client.riffy.players.get(message.guild.id);
+            if (!player) return messages.error(message.channel, "Nothing is playing! Use play command first.");
+
+            const is247 = twentyFourSeven.get(message.guild.id);
+            if (is247) {
+                twentyFourSeven.delete(message.guild.id);
+                messages.success(message.channel, `${emojis.success} 24/7 mode disabled!`);
+            } else {
+                twentyFourSeven.set(message.guild.id, true);
+                messages.success(message.channel, `${emojis.success} 24/7 mode enabled! I will stay in the voice channel even when the queue ends.`);
+            }
             break;
         }
 
@@ -261,13 +405,20 @@ client.riffy.on("nodeError", (node, error) => {
 
 client.riffy.on("trackStart", async (player, track) => {
     const channel = client.channels.cache.get(player.textChannel);
-    messages.nowPlaying(channel, track);
+    if (channel) messages.nowPlaying(channel, track);
 });
 
 client.riffy.on("queueEnd", async (player) => {
     const channel = client.channels.cache.get(player.textChannel);
+    
+    // Check if 24/7 mode is enabled
+    if (twentyFourSeven.get(player.guildId)) {
+        if (channel) messages.success(channel, `${emojis.success} Queue ended but 24/7 mode is active! I'll stay here.`);
+        return;
+    }
+    
+    if (channel) messages.queueEnded(channel);
     player.destroy();
-    messages.queueEnded(channel);
 });
 
 client.on("raw", (d) => {
@@ -275,4 +426,4 @@ client.on("raw", (d) => {
     client.riffy.updateVoiceState(d);
 });
 
-client.login(config.botToken); 
+client.login(config.botToken);
